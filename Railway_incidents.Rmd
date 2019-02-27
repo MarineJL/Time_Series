@@ -1,0 +1,414 @@
+---
+title: "Time Series - Group Project"
+author: "KICK-DEVOS-JACQUEMIN"
+date: "6 f?vrier 2019"
+output: html_notebook
+---
+
+# Libraries
+```{r message=FALSE, warning=FALSE}
+rm(list=ls())
+
+library(tidyverse)
+library(forecast)
+library(tseries)
+```
+
+# Data import
+We use open data provided by SNCF
+The dataset lists the incidents throughout the years and is available here https://data.sncf.com/explore/dataset/incidents-securite/table/?sort=date
+
+```{r}
+data <- read.csv(file = "incidents-securite.csv", header=TRUE, sep=";")
+head(data)
+```
+
+# Data preparation
+We are only interested on the number of incidents per week or month, we transform the data adequately.
+
+First, we extract valuable information on date
+```{r}
+data.time <- data %>% mutate(ID = 1:nrow(data)) %>% select(c(ID,Date))
+data.time$Date <- as.POSIXct(strptime(data.time$Date, format='%Y-%m-%d'))
+
+data.time$Year <-  as.integer(strftime(data.time$Date, format = "%Y"))
+data.time$Month <-  as.integer(strftime(data.time$Date, format = "%m"))
+data.time$Week <- as.integer(strftime(data.time$Date, format = "%V"))
+
+data.time$YearMonth <-  format(as.Date(data.time$Date), "%Y-%m")
+
+summary(data.time)
+```
+
+We have some issues with weeks overlapping years
+```{r}
+data.time %>% filter(Week < 5 & Month == 12 )
+data.time %>% filter(Week > 10 & Month == 1 )
+```
+
+```{r}
+Case1.ID <- data.time %>% filter(Week < 5 & Month == 12 ) %>% select(ID)
+Case2.ID <- data.time %>% filter(Week > 10 & Month == 1 ) %>% select(ID)
+
+data.Case1 <- data.time %>% filter(ID %in% Case1.ID$ID) %>% mutate(Year = Year + 1)
+data.Case2 <- data.time %>% filter(ID %in% Case2.ID$ID) %>% mutate(Year = Year - 1)
+data.Case0 <- data.time %>% filter(!(ID %in% Case1.ID$ID) & !(ID %in% Case2.ID$ID))
+
+data.time <- rbind(data.Case0,data.Case1,data.Case2) %>% arrange(ID)
+
+data.time %>% filter(Week < 5 & Month == 12 )
+data.time %>% filter(Week > 10 & Month == 1 )
+```
+The year issue has been fixed
+
+
+- For monthly time series :
+```{r}
+# We exclude both first and last month as data is not complete
+First.Month <- min(data.time$YearMonth)
+Last.Month <- max(data.time$YearMonth)
+start = c(as.integer(substr(First.Month,1,4)),as.integer(substr(First.Month,6,7))+1)
+
+data.monthly <- data.time %>% filter(YearMonth != First.Month & YearMonth != Last.Month )
+data.monthly <- data.monthly %>% group_by(YearMonth) %>% summarize(Incidents =n()) %>% arrange(YearMonth)
+monthly.ts <- ts(data.monthly$Incidents,frequency=12,start=start)
+
+monthly.ts
+```
+```{r}
+plot(monthly.ts)
+```
+
+- For weekly time series, we check we have incidents for every week
+```{r}
+data.time %>% ggplot() + aes(y=Year,x=Week) + geom_point()
+```
+We don't, we see we have a year with 53 weeks and others with missing weeks
+```{r}
+data.weekly <- data.time
+data.weekly <- data.weekly %>% mutate(Month = sprintf("%02d", Month))
+data.weekly <- data.weekly %>% mutate(Week = sprintf("%02d", Week))
+data.weekly <- data.weekly %>% mutate(YearWeek = paste(Year,Week,sep="-"))
+
+First.Week <- min(data.weekly$YearWeek)
+Last.Week <- max(data.weekly$YearWeek)
+
+years <- min(data.time$Year):max(data.time$Year)
+weeks <- sprintf("%02d",1:52)
+
+YM <- paste(rep(years,each=52),weeks,sep = "-")
+YM <- YM[YM >= First.Week & YM <= Last.Week]
+YM.dataset <- unique(data.weekly$YearWeek)
+
+ExtraValues <- YM.dataset[which(!YM.dataset %in% YM)]
+MissingValues <- YM[which(!YM %in% YM.dataset)]
+
+MissingValues <- MissingValues[MissingValues < max(data.time$Year) & MissingValues > First.Week]
+
+print(paste("Missing Values : ",toString(MissingValues)))
+print(paste("Extra values :", toString(ExtraValues)))
+```
+
+We will manually input  0 and delete the week 53 to keep a frequency of 52
+```{r}
+# We also delete the first and last week. 
+# We actually delete all data from 2019 as the first week is missing
+start = c(as.integer(substr(First.Week,1,4)),as.integer(substr(First.Week,6,7))+1)
+
+data.weekly <- data.weekly %>% filter(YearWeek != First.Week & Year < max(Year))
+data.weekly <- data.weekly %>% group_by(YearWeek) %>% summarize(Incidents =n()) %>% arrange(YearWeek)
+
+#We fix Missing Values and extra values
+data.weekly <- data.weekly %>% filter(!(YearWeek %in% ExtraValues)) 
+data.weekly.add <- data.frame(YearWeek = MissingValues, Incidents = rep(0,length(MissingValues)))
+
+data.weekly <- rbind(data.weekly.add,data.weekly) 
+data.weekly <- data.weekly %>% mutate(ordering = gsub('-','',data.weekly$YearWeek))
+data.weekly <- data.weekly %>% arrange(ordering) %>% select(YearWeek,Incidents)
+
+weekly.ts <- ts(data.weekly$Incidents,frequency=52,start=start)
+plot(weekly.ts)
+```
+
+# Time serie Analysis
+
+We will try to forecast weekly datas (plot right before)
+- It's weekly data, starting from the 35th week of 2014 (August)
+- There's a clear downward trend
+- No obvious seasonality
+- There is no stationarity
+
+## Data Inspection : Stationarity
+
+We can't look at the log of the Time Serie to reduce its variance since some observations are null
+
+We get rid of the trend by using a diff
+```{r}
+plot(diff(weekly.ts), main=expression(paste(Delta,"Incidents")), ylab ="")
+```
+- TWe can't spot trend anylonger
+
+We check for seasonality with a monthplot
+```{r}
+monthplot(diff(weekly.ts), main=expression(paste("Monthplot of ",Delta,"Incident")), ylab ="")
+```
+- There is seasonality : the average of each week (and therefore expected values) are different
+- Therefore this time serie is still not stationary
+
+```{r}
+y = diff(diff(weekly.ts), lag = 52)
+plot(y, main=expression(paste(Delta, Delta[52], "Incidents")), ylab ="")
+```
+- We go in differences twice (by applying twice the difference operator), and we plot the result. The data look now stationary.
+
+# Model Specification
+
+We look at the correlogram
+```{r}
+acf(y)
+```
+- Based on the correlogram, an MA(2) seems appropriate
+
+We look at the partial correlogram
+```{r}
+pacf(y)
+```
+- Based on the partial correlogram, an AR(5) seems appropriate
+- We can therefore look at ARMA models starting at ARMA(1,1) on top of that
+
+# Model Estimation - disregarding Seasonality
+
+```{r}
+model_MA1 <- arima(y,order=c(0,0,1))
+model_MA2 <- arima(y,order=c(0,0,2))
+
+model_AR1 <- arima(y,order=c(1,0,0))
+model_AR2 <- arima(y,order=c(2,0,0))
+model_AR3 <- arima(y,order=c(3,0,0))
+model_AR4 <- arima(y,order=c(4,0,0))
+model_AR5 <- arima(y,order=c(5,0,0))
+
+model_ARMA11 <- arima(y,order=c(1,0,1))
+model_ARMA21 <- arima(y,order=c(2,0,1))
+model_ARMA12 <- arima(y,order=c(1,0,2))
+model_ARMA22 <- arima(y,order=c(2,0,2))
+```
+
+```{r echo=TRUE, results=FALSE}
+if(FALSE){
+summary(model_MA1) # ma1 ok
+summary(model_MA2) # ma2 ok
+
+summary(model_AR1) # ar1 ok
+summary(model_AR2) # ar2 ok
+summary(model_AR3) # ar3 ok
+summary(model_AR4) # ar4 ok
+summary(model_AR5) # ar5 ok
+
+summary(model_ARMA11) # ok
+summary(model_ARMA21) # ok
+summary(model_ARMA12) # ma1 not ok
+summary(model_ARMA22) # ma1 ar2 not ok
+}
+```
+
+# Model Validation
+
+We create the functions for expanding windows and for model evaluation
+
+```{r}
+ExpandingWindow <- function(y,model,S=round(0.75*length(y)),h=1){
+  
+  order <- c()
+  
+  for (i in substr(model$call$order,1,1)[2:4]){
+    order <-c(order,as.integer(i))
+  }
+  
+  error1.h<-c()
+  
+  for (i in S:(length(y)-h)){
+  mymodel.sub<-arima(y[1:i], order = order)
+  predict.h<-predict(mymodel.sub,n.ahead=h)$pred[h]
+  error1.h<-c(error1.h,y[i+h]-predict.h)
+  }
+  
+    mean(abs(error1.h))
+}
+
+ModelEvaluation <- function(model,hos=TRUE){
+  order <- toString(model$call$order)
+  season <- toString(model$call$seasonal)
+  bic <- BIC(model)
+  bt10 <- Box.test(model$res,lag=10, type = "Ljung-Box")$p.value
+  mae <- ExpandingWindow(y,model,h=4)
+
+  if(grepl(season,"c")){name = paste("ARMA(",model$call$order[2],",",model$call$order[4],")",sep="")}
+  else {name = paste("SARMA(",model$call$order[2],",",model$call$order[4],")(",model$call$seasonal[2],",",model$call$seasonal[4],")",sep="")}
+  
+  row <- data.frame("Model" = name,"Highest order significant" = hos , "BIC" = bic, "Correlogram" = "", "Q-test 10" = bt10 > 0.05, "MAE (h=4)" = mae )
+  
+  row
+}
+```
+
+We evaluate all models
+```{r}
+Significant.Models <- list(model_MA1, model_MA2, model_AR1, model_AR2, model_AR3, model_AR4, model_AR5, model_ARMA11, model_ARMA21)
+
+NotSignificant.Models <- list(model_ARMA12,model_ARMA22)
+
+Models.Stats <- data.frame()
+
+for(model in Significant.Models){
+  Models.Stats <- rbind(Models.Stats,ModelEvaluation(model))
+}
+
+for(model in NotSignificant.Models){
+  Models.Stats <- rbind(Models.Stats,ModelEvaluation(model,hos=FALSE))
+}
+
+Models.Stats
+```
+
+
+
+We need to manually validate each correlogram of residuals
+```{r}
+par(oma=c(0,0,1,0))
+
+for(model in append(Significant.Models,NotSignificant.Models)){
+  
+  AR.order <- toString(substr(model$call$order,1,1)[2])
+  MA.order <- toString(substr(model$call$order,1,1)[4])
+  model.name <-paste("ARMA(",AR.order,",",MA.order,")",sep="")
+  
+  acf(model$res,plot=T, main="")
+  title(paste(model.name, "Residual Correlogram"),outer = T)
+}
+```
+
+We had Correlogram validation to the model summary
+```{r}
+Correlogram.val <- c(F,F,F,F,F,F,T,F,T,F,F)
+Models.Stats$Correlogram <- Correlogram.val
+Models.Stats
+```
+
+
+Automatic model selection can be used as well
+```{r}
+myforecast<-forecast(y,method="arima")
+myforecast$model
+```
+
+We recreate the model and check both the summary and the correlogram
+```{r}
+model_ARMA13 <- arima(y,order=c(1,0,3))
+summary(model_ARMA13)
+
+par(oma=c(0,0,1,0))
+
+acf(model_ARMA13$res,plot=T, main="")
+title("ARMA(1,3) Residual Correlogram",outer = T)
+```
+
+```{r}
+auto.stats <- ModelEvaluation(model_ARMA13)
+auto.stats$Correlogram = TRUE
+auto.stats
+```
+
+#Model Comparison
+We can now see all our models
+```{r}
+Models.Stats <- rbind(Models.Stats,auto.stats)
+Models.Stats
+```
+
+
+We select only validated models
+```{r}
+ValidatedModels.Stats <- Models.Stats %>% filter(Highest.order.significant == T & Correlogram == T & Q.test.10 == T)
+ValidatedModels.Stats
+```
+
+We would like to compare the 3 validated models.
+- ARMA(2,1) has the smallest BIC value
+- ARMA(5,0) has the highest BIC and MAE, we drop this model. 
+- ARMA(2,1) and ARMA(1,3) have the smallest MAE, we want to compare those 2 models
+
+We  compute the prediction errors and do a Diebold Mariano test
+```{r}
+S=round(0.75*length(y))
+h=4
+error1.h<-c()
+for (i in S:(length(y)-h))
+{
+  mymodel.sub<-arima(y[1:i], order = c(2,0,1))
+  predict.h<-predict(mymodel.sub,n.ahead=h)$pred[h]
+  error1.h<-c(error1.h,y[i+h]-predict.h)
+}
+
+error2.h<-c()
+for (i in S:(length(y)-h))
+{
+  mymodel.sub<-arima(y[1:i], order = c(1,0,3))
+  predict.h<-predict(mymodel.sub,n.ahead=h)$pred[h]
+  error2.h<-c(error2.h,y[i+h]-predict.h)
+}
+
+boxplot(error1.h,error2.h)
+
+```
+- There is no obvious advantage for one of the models. 
+
+```{r}
+MAE1<-mean(abs(error1.h))
+MAE2<-mean(abs(error2.h))
+# Model 2 has a smaller Mean Absolute Error
+MSE1<-mean(abs(error1.h)^2)
+MSE2<-mean(abs(error2.h)^2)
+# Model 2 has a smaller Mean Squared Error
+```
+Model 2 has a slightly smaller Mean Absolute Error and Mean Squared Error
+
+Diebold Mariano test
+
+```{r}
+dm.test(error1.h,error2.h,h=h,power=1) 
+# no significant difference between MAE1 and MAE2
+dm.test(error1.h,error2.h,h=h,power=2) 
+# no significant difference between MSE1 and MSE2
+```
+- We conclude that the forecast performance of the 2 models, measured by MAE and MSE, is not significantly different (p-value > 5%)
+
+
+TODO : 
+Eventuellement essayer les SARIMA mais d'apres ACF et PACF pas gagn?
+Eventuellement regarder la serie mensuelle
+
+# Prediction
+We get predictions for the 4 upcoming months, with model ARMA(1,3)
+```{r}
+model_final=model_ARMA13
+myforecast<-predict(model_final,n.ahead=4)
+expected=myforecast$pred
+lower=myforecast$pred-qnorm(0.975)*myforecast$se
+upper=myforecast$pred+qnorm(0.975)*myforecast$se
+cbind(lower,expected,upper) 
+```
+
+```{r}
+# We merge the last observation with predicted time series
+last_obs <- tail(weekly.ts,n=1)
+plot_pred <- ts(c(last_obs,expected), start=start(last_obs), frequency=frequency(expected))
+plot_lower <- ts(c(last_obs,lower), start=start(last_obs), frequency=frequency(lower))
+plot_upper <- ts(c(last_obs,upper), start=start(last_obs), frequency=frequency(upper))
+
+plot(weekly.ts)
+lines(plot_pred,col="red")
+lines(plot_lower,col="blue")
+lines(plot_upper,col="blue")
+
+```
